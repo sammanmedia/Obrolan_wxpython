@@ -1,25 +1,28 @@
-# Obrolan v9
-# - Tombol "Chatroom Online" diperbaiki: kontrol klik sendiri (bukan StaticText), klik cepat/dobel
-#   tetap terbaca, popup selalu terbuka (ada pesan "memuat"/error kalau data belum ada), cadangan menu.
-# - Jendela dibuka setinggi layar (area kerja, di atas taskbar), nempel kanan/kiri/tengah (obrolan.cfg).
-# - Centang ala WhatsApp pada pesan sendiri: 1 centang = sampai server, 2 centang hijau = sudah dibaca
-#   (butuh presence.php versi v9).
-# - (dari v8) background gambar/GIF, daftar online, reply, notif reply hanya ke yang dibalas.
+# Obrolan v9.2
+# - Cek update lewat GitHub Releases: tulisan "Cek update" sejajar dengan "Chatroom Online",
+#   nomor versi "v9.2" di pojok kanan-bawah. Klik saat ada update -> unduh Obrolan.exe baru,
+#   ganti exe lama, aplikasi restart sendiri (khusus dijalankan sebagai .exe).
+# - (dari v9.1) perbaikan chat kosong (centang) & popup online yang macet, centang baca ala WhatsApp,
+#   jendela setinggi layar, background gambar/GIF, daftar online, reply.
 import base64
 import filecmp
 import getpass
+import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
 import wave
+import webbrowser
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -37,6 +40,18 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = Path(__file__).resolve().parent
 APP_CFG_PATH = APP_DIR / "obrolan.cfg"
+
+# ---- versi & update (GitHub Releases) ----
+VERSION = "9.2"                              # HARUS sama dengan tag Release (tag "v9.2")
+GITHUB_REPO = "sammanmedia/Obrolan_wxpython"
+UPDATE_ASSET = "Obrolan.exe"                 # nama file exe di Release (tetap, tanpa nomor versi)
+RESTART_EXE = None                           # diisi saat update selesai -> dijalankan ulang di main()
+
+
+def parse_version(v):
+    """'v9.2' -> (9, 2). Dipakai untuk membandingkan versi."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v)))
+
 BG_DIR = APP_DIR / "background"   # hasil salinan gambar dari tombol [Pilih Gambar]
 
 DEFAULT_APP_CFG = {
@@ -1301,9 +1316,10 @@ class ChatView(wx.ScrolledWindow):
 class LinkLabel(wx.Window):
     """Teks biru bergaris bawah yang bisa diklik. Lebih andal daripada wx.StaticText
     (StaticText di Windows sering tidak menerima klik, dan klik cepat dibaca sebagai klik-dobel)."""
-    def __init__(self, parent, text, on_click):
+    def __init__(self, parent, text, on_click, color=None):
         super().__init__(parent, style=wx.BORDER_NONE | wx.WANTS_CHARS)
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self._color = color or wx.Colour(24, 119, 242)
         self._text = text
         self._on_click = on_click
         self._hot = False
@@ -1335,6 +1351,10 @@ class LinkLabel(wx.Window):
             self._fit()
             self.Refresh()
 
+    def set_color(self, color):
+        self._color = color
+        self.Refresh()
+
     def _set_hot(self, v):
         self._hot = v
         self.Refresh()
@@ -1348,7 +1368,10 @@ class LinkLabel(wx.Window):
         dc.SetBackground(wx.Brush(self.GetParent().GetBackgroundColour()))
         dc.Clear()
         dc.SetFont(self._font)
-        dc.SetTextForeground(wx.Colour(10, 80, 190) if self._hot else wx.Colour(24, 119, 242))
+        c = self._color
+        if self._hot:  # sedikit lebih gelap saat mouse di atasnya
+            c = wx.Colour(max(0, c.Red() - 40), max(0, c.Green() - 40), max(0, c.Blue() - 40))
+        dc.SetTextForeground(c)
         dc.DrawText(self._text, 4, 4)
 
 
@@ -1546,8 +1569,21 @@ class ChatFrame(wx.Frame):
         self.lbl_status.SetMinSize((10, -1))
         self.lbl_status.SetForegroundColour(wx.Colour(90, 96, 105))
         self.lbl_online = LinkLabel(self.foot, "Chatroom Online : ...", self.on_online_click)
+        self.C_UPD_IDLE = wx.Colour(110, 118, 130)
+        self.C_UPD_NEW = wx.Colour(30, 140, 60)
+        self.C_UPD_ERR = wx.Colour(200, 60, 60)
+        self.lbl_update = LinkLabel(self.foot, "Cek update", self.on_update_click, self.C_UPD_IDLE)
+        self.lbl_version = wx.StaticText(self.foot, label=f"v{VERSION}")
+        self.lbl_version.SetForegroundColour(wx.Colour(110, 118, 130))
+        row2 = wx.BoxSizer(wx.HORIZONTAL)
+        row2.Add(self.lbl_online, 0, wx.ALIGN_CENTER_VERTICAL)
+        row2.Add(self.lbl_update, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
+        row2.AddStretchSpacer(1)
+        row2.Add(self.lbl_version, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 2)
         fs.Add(self.lbl_status, 0, wx.EXPAND)
-        fs.Add(self.lbl_online, 0, wx.TOP, 2)
+        fs.Add(row2, 0, wx.EXPAND | wx.TOP, 2)
+        self._latest_tag = ""       # tag Release terbaru yang ditemukan
+        self._upd_busy = False
         self.foot.SetSizer(fs)
         vbox.Add(self.foot, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.online = None          # None = belum tahu / gagal; list = [{cid, name}]
@@ -1579,6 +1615,11 @@ class ChatFrame(wx.Frame):
         self.view.on_scrolled = self._update_my_read
 
         self._place_window()
+
+        self._upd_timer = wx.Timer(self)       # cek update otomatis tiap 6 jam
+        self.Bind(wx.EVT_TIMER, lambda e: self.check_update(), self._upd_timer)
+        self._upd_timer.Start(6 * 3600 * 1000)
+        wx.CallLater(4000, self.check_update)  # dan 4 detik setelah aplikasi dibuka
 
         self.timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, lambda e: self.on_tick(), self.timer)
@@ -1635,7 +1676,7 @@ class ChatFrame(wx.Frame):
         save_config(self.cfg)
 
     def _update_title(self):
-        self.SetTitle("Obrolan - " + self.rooms[self.active]["chatroom"])
+        self.SetTitle(f"Obrolan v{VERSION} - " + self.rooms[self.active]["chatroom"])
 
     def on_settings(self, _evt):
         p = self.app_cfg["Pengaturan"]
@@ -1934,6 +1975,145 @@ class ChatFrame(wx.Frame):
                 return
         self.set_status(f"Belum ada pesan dari {user['name']} di chatroom ini.")
 
+    # ---------- cek update (GitHub Releases) ----------
+    def _set_upd(self, text, color, tip=""):
+        self.lbl_update.set_text(text)
+        self.lbl_update.set_color(color)
+        self.lbl_update.SetToolTip(tip)
+        self.foot.Layout()
+
+    def check_update(self):
+        if self._upd_busy:
+            return
+        self._upd_busy = True
+        self._set_upd("Memeriksa update...", self.C_UPD_IDLE)
+        threading.Thread(target=self._upd_check_worker, daemon=True).start()
+
+    def _upd_check_worker(self):
+        """Tanpa API GitHub (tidak kena batas request): /releases/latest mengarah ke .../tag/<tag>."""
+        try:
+            r = requests.get(f"https://github.com/{GITHUB_REPO}/releases/latest",
+                             allow_redirects=False, timeout=8, headers={"User-Agent": "Obrolan"})
+            loc = r.headers.get("Location", "")
+            if "/tag/" not in loc:
+                raise ValueError("belum ada Release / repo tidak publik")
+            tag = loc.rsplit("/tag/", 1)[1].strip().strip("/")
+            wx.CallAfter(self._upd_checked, tag, "")
+        except Exception as e:
+            wx.CallAfter(self._upd_checked, "", str(e))
+
+    def _upd_checked(self, tag, err):
+        self._upd_busy = False
+        if err:
+            self._set_upd("Gagal cek update (klik ulang)", self.C_UPD_ERR, err)
+            return
+        try:
+            newer = parse_version(tag) > parse_version(VERSION)
+        except Exception:
+            newer = False
+        if newer:
+            self._latest_tag = tag
+            self._set_upd(f"Update {tag} tersedia - klik untuk perbarui", self.C_UPD_NEW,
+                          f"Versi kamu v{VERSION}. Klik untuk mengunduh {tag}.")
+        else:
+            self._latest_tag = ""
+            self._set_upd("Sudah versi terbaru", self.C_UPD_IDLE,
+                          f"v{VERSION} adalah versi terbaru. Klik untuk cek lagi.")
+
+    def on_update_click(self, _evt=None):
+        if self._upd_busy:
+            return
+        if not self._latest_tag:
+            self.check_update()
+            return
+        if not getattr(sys, "frozen", False):
+            # dijalankan sebagai .pyw -> tidak bisa mengganti diri sendiri, buka halaman Release saja
+            webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
+            self.set_status("Dijalankan dari .pyw: unduh Obrolan.exe terbaru dari halaman Release.")
+            return
+        if wx.MessageBox(f"Perbarui Obrolan ke {self._latest_tag}?\n\n"
+                         "Aplikasi akan ditutup lalu terbuka lagi otomatis.\n"
+                         "Pengaturan (obrolan.cfg, background) tidak diubah.",
+                         "Update", wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES:
+            return
+        self._upd_busy = True
+        self._set_upd("Mengunduh 0%...", self.C_UPD_IDLE)
+        threading.Thread(target=self._upd_download_worker, daemon=True).start()
+
+    def _upd_download_worker(self):
+        exe = Path(sys.executable)
+        new = exe.with_name(exe.name + ".new")
+        try:
+            url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{UPDATE_ASSET}"
+            digest = ""
+            try:  # API dipakai SEKALI saat update, hanya untuk mengambil checksum (boleh gagal)
+                j = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                                 timeout=8, headers={"User-Agent": "Obrolan"}).json()
+                for a in j.get("assets", []):
+                    if a.get("name") == UPDATE_ASSET:
+                        digest = str(a.get("digest") or "")
+                        url = a.get("browser_download_url") or url
+            except Exception:
+                pass
+            done = 0
+            h = hashlib.sha256()
+            with requests.get(url, stream=True, timeout=20, headers={"User-Agent": "Obrolan"}) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("Content-Length") or 0)
+                with open(new, "wb") as f:
+                    for chunk in r.iter_content(256 * 1024):
+                        f.write(chunk)
+                        h.update(chunk)
+                        done += len(chunk)
+                        if total:
+                            wx.CallAfter(self._set_upd, f"Mengunduh {done * 100 // total}%...", self.C_UPD_IDLE)
+            with open(new, "rb") as f:
+                head = f.read(2)
+            if head != b"MZ" or done < 1_000_000:
+                raise ValueError("file unduhan tidak valid (bukan exe / terpotong)")
+            if digest.startswith("sha256:") and digest[7:].lower() != h.hexdigest().lower():
+                raise ValueError("checksum tidak cocok, unduhan dibatalkan")
+            wx.CallAfter(self._upd_apply, new)
+        except Exception as e:
+            try:
+                new.unlink()
+            except Exception:
+                pass
+            wx.CallAfter(self._upd_failed, str(e))
+
+    def _upd_failed(self, msg):
+        self._upd_busy = False
+        self._set_upd("Update gagal (klik untuk coba lagi)", self.C_UPD_ERR, msg)
+        wx.MessageBox(f"Update gagal:\n{msg}", "Update", wx.OK | wx.ICON_ERROR, self)
+
+    def _upd_apply(self, new):
+        """Windows tidak boleh menimpa exe yang jalan, tapi BOLEH mengganti namanya:
+        exe lama -> .old, exe baru -> nama asli, lalu restart (di main())."""
+        global RESTART_EXE
+        exe = Path(sys.executable)
+        old = exe.with_name(exe.name + ".old")
+        try:
+            try:
+                if old.exists():
+                    old.unlink()
+            except OSError:
+                old = exe.with_name(f"{exe.name}.{int(time.time())}.old")
+            os.replace(exe, old)
+            try:
+                os.replace(new, exe)
+            except Exception:
+                os.replace(old, exe)   # gagal -> kembalikan exe lama
+                raise
+        except Exception as e:
+            try:
+                new.unlink()
+            except Exception:
+                pass
+            self._upd_failed(f"tidak bisa mengganti file ({e}). Pastikan folder aplikasi bisa ditulis.")
+            return
+        RESTART_EXE = str(exe)
+        self.exit_app()
+
     # ---------- status baca ----------
     def _update_my_read(self):
         """Pesan dianggap sudah dibaca bila jendela terlihat (tidak di tray/minimize)
@@ -2020,6 +2200,7 @@ class ChatFrame(wx.Frame):
         save_config(self.cfg)
         save_app_cfg(self.app_cfg)
         self.timer.Stop()
+        self._upd_timer.Stop()
         self.tray.set_alert(False)
         self.tray.RemoveIcon()
         self.tray.Destroy()
@@ -2109,6 +2290,13 @@ class ChatFrame(wx.Frame):
 
 
 def main():
+    if getattr(sys, "frozen", False):  # bersihkan sisa update sebelumnya
+        exe = Path(sys.executable)
+        for p in list(exe.parent.glob(exe.name + ".*old")) + [exe.with_name(exe.name + ".new")]:
+            try:
+                p.unlink()
+            except OSError:
+                pass
     app_cfg = load_app_cfg()
     port = app_cfg["Pengaturan"]["lock_port"]
 
@@ -2128,7 +2316,14 @@ def main():
     frame.Show()
     app.MainLoop()
     if srv:
-        srv.close()
+        srv.close()   # lepas kunci dulu supaya instance baru tidak dikira "sudah ada yang jalan"
+    if RESTART_EXE:
+        env = dict(os.environ)
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"   # exe PyInstaller baru harus ekstrak sendiri
+        env.pop("_MEIPASS2", None)
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen([RESTART_EXE], cwd=str(Path(RESTART_EXE).parent), env=env,
+                         close_fds=True, creationflags=flags)
 
 
 if __name__ == "__main__":
