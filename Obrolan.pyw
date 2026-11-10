@@ -1,5 +1,8 @@
-# Obrolan v9.2
-# - Cek update lewat GitHub Releases: tulisan "Cek update" sejajar dengan "Chatroom Online",
+# Obrolan v9.3
+# - Teks chat bisa diblok pakai mouse (tahan & geser; klik-ganda = pilih satu kata; Ctrl+A = pilih semua),
+#   lalu disalin dengan Ctrl+C atau klik-kanan -> "Salin" / "Salin pesan".
+# - Tombol panah balas (muncul saat hover chat orang lain) sekarang ada tulisan kecil "Balas".
+# - (dari v9.2) Cek update lewat GitHub Releases: tulisan "Cek update" sejajar dengan "Chatroom Online",
 #   nomor versi "v9.2" di pojok kanan-bawah. Klik saat ada update -> unduh Obrolan.exe baru,
 #   ganti exe lama, aplikasi restart sendiri (khusus dijalankan sebagai .exe).
 # - (dari v9.1) perbaikan chat kosong (centang) & popup online yang macet, centang baca ala WhatsApp,
@@ -42,7 +45,7 @@ else:
 APP_CFG_PATH = APP_DIR / "obrolan.cfg"
 
 # ---- versi & update (GitHub Releases) ----
-VERSION = "9.2"                              # HARUS sama dengan tag Release (tag "v9.2")
+VERSION = "9.3"                              # HARUS sama dengan tag Release (tag "v9.3")
 GITHUB_REPO = "sammanmedia/Obrolan_wxpython"
 UPDATE_ASSET = "Obrolan.exe"                 # nama file exe di Release (tetap, tanpa nomor versi)
 RESTART_EXE = None                           # diisi saat update selesai -> dijalankan ulang di main()
@@ -722,6 +725,10 @@ class ChatView(wx.ScrolledWindow):
     QPY = 4
     ARROW = 28        # diameter tombol panah reply
     ARROW_GAP = 6     # jarak panah ke bubble
+    ARROW_W = 64      # lebar tombol "panah + Balas" (dihitung ulang di __init__)
+    LABEL_BALAS = "Balas"
+    C_SEL_OTHER = wx.Colour(24, 119, 242, 70)    # warna blok teks di bubble orang lain
+    C_SEL_ME = wx.Colour(8, 38, 110, 150)        # warna blok teks di bubble sendiri
     TICKW = 15        # lebar area centang di pojok kanan-bawah bubble sendiri
     C_TICK = wx.Colour(205, 226, 255)     # 1 centang: sudah sampai
     C_TICK_READ = wx.Colour(120, 240, 165)  # 2 centang: sudah dibaca
@@ -747,6 +754,20 @@ class ChatView(wx.ScrolledWindow):
         self.f_name = wx.Font(wx.FontInfo(9).Bold())
         self.f_small = wx.Font(wx.FontInfo(8))
         self.f_quote = wx.Font(wx.FontInfo(9))
+
+        # ukuran tombol "panah + Balas"
+        _dc = wx.ClientDC(self)
+        _dc.SetFont(self.f_small)
+        _lw, self.label_h = _dc.GetTextExtent(self.LABEL_BALAS)
+        self.arrow_w = int(self.ARROW + _lw + 7)
+        del _dc
+
+        # seleksi teks: posisi = (index item, index baris, index karakter)
+        self.sel_a = None
+        self.sel_b = None
+        self.sel_drag = False
+        self._last_cw = -1
+        self.sel_timer = wx.Timer(self)
 
         self.messages = []
         self.my_cid = CID
@@ -774,12 +795,22 @@ class ChatView(wx.ScrolledWindow):
         self.Bind(wx.EVT_MOTION, self.on_motion)
         self.Bind(wx.EVT_LEAVE_WINDOW, self.on_leave)
         self.Bind(wx.EVT_LEFT_UP, self.on_left_up)
+        self.Bind(wx.EVT_LEFT_DOWN, self.on_left_down)
+        self.Bind(wx.EVT_LEFT_DCLICK, self.on_dclick)
+        self.Bind(wx.EVT_RIGHT_DOWN, self.on_right_down)
+        self.Bind(wx.EVT_KEY_DOWN, self.on_key)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self.on_capture_lost)
+        self.Bind(wx.EVT_TIMER, self.on_sel_timer, self.sel_timer)
         self.Bind(wx.EVT_MOUSEWHEEL, self.on_wheel)
         self.Bind(wx.EVT_SCROLLWIN, self.on_wheel)
 
     # ---------- API publik ----------
     def set_messages(self, msgs, my_cid, force_bottom=False):
         at_bottom = self._at_bottom()
+        if self.sel_a is not None:
+            old = self.messages
+            if not msgs or len(msgs) < len(old) or (old and msgs[0] != old[0]):
+                self.sel_a = self.sel_b = None   # ganti chatroom / pesan lama bergeser
         self.messages = msgs
         self.my_cid = my_cid
         self._layout()
@@ -917,7 +948,11 @@ class ChatView(wx.ScrolledWindow):
         return s[:lo] + "…"
 
     def _wrap(self, gc, text, maxw):
+        """-> (lines, seps). seps[k] = pemisah saat baris k disambung ke baris berikutnya
+        ("\n" = enter asli, " " = pindah baris karena kata, "" = kata panjang terpotong).
+        Dipakai supaya hasil copy tidak kebanyakan enter."""
         lines = []
+        seps = []
         for para in text.split("\n"):
             cur = ""
             for word in para.split(" "):
@@ -927,16 +962,31 @@ class ChatView(wx.ScrolledWindow):
                     continue
                 if cur:
                     lines.append(cur)
+                    seps.append(" ")
                     cur = ""
                 while self._ext(gc, word)[0] > maxw and len(word) > 1:
                     n = len(word)
                     while n > 1 and self._ext(gc, word[:n])[0] > maxw:
                         n -= 1
                     lines.append(word[:n])
+                    seps.append("")
                     word = word[n:]
                 cur = word
             lines.append(cur)
-        return lines
+            seps.append("\n")
+        return lines, seps
+
+    def _partials(self, gc, ln):
+        """Lebar kumulatif tiap karakter pada satu baris (untuk blok teks)."""
+        if not ln:
+            return []
+        try:
+            p = [float(v) for v in gc.GetPartialTextExtents(ln)]
+            if len(p) == len(ln):
+                return p
+        except Exception:
+            pass
+        return [float(self._ext(gc, ln[:j])[0]) for j in range(1, len(ln) + 1)]
 
     # ---------- layout ----------
     def _layout(self):
@@ -978,9 +1028,10 @@ class ChatView(wx.ScrolledWindow):
             show_name = (not mine) and sender != prev_sender
 
             gc.SetFont(self.f_msg, wx.BLACK)
-            lines = self._wrap(gc, body, max_bw - 2 * self.BPX)
+            lines, seps = self._wrap(gc, body, max_bw - 2 * self.BPX)
             lh = self._ext(gc, "Ag")[1]
             tw = max(self._ext(gc, ln)[0] for ln in lines)
+            parts = [self._partials(gc, ln) for ln in lines]
 
             nh = nw = 0
             if show_name:
@@ -1016,12 +1067,13 @@ class ChatView(wx.ScrolledWindow):
                      + len(lines) * lh + 2 + timeh)
             if q:
                 q["y"] = self.BPY + (nh + 2 if show_name else 0)
+            ty0 = int(self.BPY + (nh + 2 if show_name else 0) + (qh + 4 if q else 0))
             x = cw - self.PAD - bw if mine else self.PAD
 
             self.items.append(dict(
                 kind="msg", mine=mine, name=name, show_name=show_name,
                 cid=cid, time=mtime, body=body, q=q,
-                lines=lines, lh=lh, nh=nh, tstr=tstr, timew=timew, timeh=timeh,
+                lines=lines, seps=seps, parts=parts, ty0=ty0, lh=lh, nh=nh, tstr=tstr, timew=timew, timeh=timeh,
                 x=x, y=y, w=bw, h=bh))
             y += bh
             prev_sender = sender
@@ -1033,10 +1085,10 @@ class ChatView(wx.ScrolledWindow):
     def _arrow_rect(self, it):
         return (it["x"] + it["w"] + self.ARROW_GAP,
                 it["y"] + (it["h"] - self.ARROW) // 2,
-                self.ARROW, self.ARROW)
+                self.arrow_w, self.ARROW)
 
     def _hit(self, px, py):
-        """-> (index, zona); zona: 'arrow' | 'quote' | 'bubble' | None"""
+        """-> (index, zona); zona: 'arrow' | 'quote' | 'text' | 'bubble' | None"""
         for i, it in enumerate(self.items):
             if it["kind"] != "msg":
                 continue
@@ -1055,6 +1107,10 @@ class ChatView(wx.ScrolledWindow):
                 if qx <= px <= x + it["w"] - self.BPX and qy <= py <= qy + q["h"]:
                     return i, "quote"
             if x <= px <= x + it["w"]:
+                t0 = top + it["ty0"]
+                if (x + self.BPX <= px <= x + it["w"] - self.BPX
+                        and t0 <= py < t0 + len(it["lines"]) * it["lh"]):
+                    return i, "text"
                 return i, "bubble"
         return -1, None
 
@@ -1080,11 +1136,19 @@ class ChatView(wx.ScrolledWindow):
         if hover != self.hover:
             self.hover = hover
             self.Refresh()
-        cur = wx.CURSOR_HAND if zone in ("arrow", "quote") else wx.CURSOR_ARROW
+        if self.sel_drag or zone == "text":
+            cur = wx.CURSOR_IBEAM
+        elif zone in ("arrow", "quote"):
+            cur = wx.CURSOR_HAND
+        else:
+            cur = wx.CURSOR_ARROW
         self.SetCursor(wx.Cursor(cur))
 
     def on_motion(self, evt):
-        self._update_hover(evt.GetPosition())
+        pt = evt.GetPosition()
+        self._update_hover(pt)
+        if self.sel_drag and evt.LeftIsDown():
+            self._drag_to(pt)
         evt.Skip()
 
     def on_leave(self, evt):
@@ -1098,6 +1162,11 @@ class ChatView(wx.ScrolledWindow):
         evt.Skip()
 
     def on_left_up(self, evt):
+        if self.sel_drag:
+            self._end_drag()
+            if self.sel_a == self.sel_b:      # cuma klik, tidak ada yang diblok
+                self.sel_a = self.sel_b = None
+                self.Refresh()
         px, py = self._client_to_virtual(evt.GetPosition())
         idx, zone = self._hit(px, py)
         if idx >= 0:
@@ -1106,6 +1175,224 @@ class ChatView(wx.ScrolledWindow):
                 self.on_reply(it)
             elif zone == "quote" and it["q"]:
                 self.jump_to(it["q"]["c"], it["q"]["t"])
+        evt.Skip()
+
+    # ---------- blok teks & copy ----------
+    @staticmethod
+    def _col_at(parts, rel, nearest=True):
+        """Posisi karakter dari koordinat x. nearest=True -> batas karakter terdekat (untuk kursor/blok),
+        False -> index karakter yang sedang ditunjuk."""
+        prev = 0.0
+        for j, w in enumerate(parts):
+            if rel < ((prev + w) / 2.0 if nearest else w):
+                return j
+            prev = w
+        return len(parts) if nearest else max(0, len(parts) - 1)
+
+    def _text_pos(self, px, py, nearest=True):
+        """Koordinat virtual -> (item, baris, kolom). Di luar bubble: dijepit ke pesan terdekat."""
+        last = -1
+        for i, it in enumerate(self.items):
+            if it["kind"] != "msg":
+                continue
+            last = i
+            if py < it["y"]:
+                return (i, 0, 0)
+            if py <= it["y"] + it["h"]:
+                n = len(it["lines"])
+                ln = int((py - it["y"] - it["ty0"]) // it["lh"]) if it["lh"] else 0
+                ln = max(0, min(n - 1, ln))
+                rel = px - (it["x"] + self.BPX)
+                return (i, ln, self._col_at(it["parts"][ln], rel, nearest))
+        if last < 0:
+            return None
+        ln = self.items[last]["lines"]
+        return (last, len(ln) - 1, len(ln[-1]))
+
+    def _sel_bounds(self):
+        if self.sel_a is None or self.sel_b is None or self.sel_a == self.sel_b:
+            return None
+        a, b = sorted((self.sel_a, self.sel_b))
+        if b[0] >= len(self.items):
+            return None
+        return a, b
+
+    @staticmethod
+    def _sel_span(bounds, idx, ln, text):
+        (ai, al, ac), (bi, bl, bc) = bounds
+        k = (idx, ln)
+        if k < (ai, al) or k > (bi, bl):
+            return 0, 0
+        c0 = ac if k == (ai, al) else 0
+        c1 = bc if k == (bi, bl) else len(text)
+        return c0, max(c0, c1)
+
+    def selected_text(self):
+        bounds = self._sel_bounds()
+        if not bounds:
+            return ""
+        (ai, al, _ac), (bi, bl, _bc) = bounds
+        out = []
+        for idx in range(ai, bi + 1):
+            it = self.items[idx]
+            if it["kind"] != "msg":
+                continue
+            buf = ""
+            n = len(it["lines"])
+            for ln, text in enumerate(it["lines"]):
+                if (idx, ln) < (ai, al) or (idx, ln) > (bi, bl):
+                    continue
+                c0, c1 = self._sel_span(bounds, idx, ln, text)
+                buf += text[c0:c1]
+                if ln + 1 < n and (idx, ln + 1) <= (bi, bl):
+                    buf += it["seps"][ln]
+            out.append(buf)
+        return "\n".join(out)
+
+    @staticmethod
+    def _to_clipboard(text):
+        if not text:
+            return False
+        ok = False
+        try:
+            if wx.TheClipboard.Open():
+                try:
+                    ok = wx.TheClipboard.SetData(wx.TextDataObject(text))
+                finally:
+                    wx.TheClipboard.Close()
+        except Exception:
+            ok = False
+        return ok
+
+    def copy_selection(self):
+        """Salin teks yang sedang diblok. Return False kalau tidak ada yang diblok."""
+        return self._to_clipboard(self.selected_text())
+
+    def clear_selection(self):
+        if self.sel_a is not None:
+            self.sel_a = self.sel_b = None
+            self.Refresh()
+
+    def select_all(self):
+        first = last = -1
+        for i, it in enumerate(self.items):
+            if it["kind"] == "msg":
+                if first < 0:
+                    first = i
+                last = i
+        if first < 0:
+            return
+        self.sel_a = (first, 0, 0)
+        ln = self.items[last]["lines"]
+        self.sel_b = (last, len(ln) - 1, len(ln[-1]))
+        self.Refresh()
+
+    def _drag_to(self, pt):
+        px, py = self._client_to_virtual(pt)
+        pos = self._text_pos(px, py)
+        if pos is not None and pos != self.sel_b:
+            self.sel_b = pos
+            self.Refresh()
+
+    def _end_drag(self):
+        self.sel_drag = False
+        if self.sel_timer.IsRunning():
+            self.sel_timer.Stop()
+        if self.HasCapture():
+            self.ReleaseMouse()
+
+    def on_capture_lost(self, _evt):
+        self.sel_drag = False
+        if self.sel_timer.IsRunning():
+            self.sel_timer.Stop()
+
+    def on_sel_timer(self, _evt):
+        """Saat blok ditarik ke atas/bawah di luar area chat -> otomatis scroll."""
+        if not self.sel_drag:
+            self.sel_timer.Stop()
+            return
+        pt = self.ScreenToClient(wx.GetMousePosition())
+        ch = self.GetClientSize().height
+        step = 0
+        if pt.y < 0:
+            step = -(1 + min(5, int(-pt.y) // 16))
+        elif pt.y > ch:
+            step = 1 + min(5, int(pt.y - ch) // 16)
+        if step:
+            self.Scroll(0, max(0, self.GetViewStart()[1] + step))
+            if self.on_scrolled:
+                wx.CallAfter(self.on_scrolled)
+        self._drag_to(pt)
+
+    def on_left_down(self, evt):
+        px, py = self._client_to_virtual(evt.GetPosition())
+        idx, zone = self._hit(px, py)
+        if zone in ("text", "bubble"):
+            pos = self._text_pos(px, py)
+            self.sel_a = self.sel_b = pos
+            if pos is not None:
+                self.sel_drag = True
+                if not self.HasCapture():
+                    self.CaptureMouse()
+                self.sel_timer.Start(50)
+            self.Refresh()
+        elif self.sel_a is not None:
+            self.clear_selection()
+        evt.Skip()
+
+    def on_dclick(self, evt):
+        """Klik-ganda: pilih satu kata."""
+        px, py = self._client_to_virtual(evt.GetPosition())
+        idx, zone = self._hit(px, py)
+        if idx < 0 or zone not in ("text", "bubble"):
+            return
+        pos = self._text_pos(px, py, nearest=False)
+        if pos is None:
+            return
+        i, ln, c = pos
+        text = self.items[i]["lines"][ln]
+        if not text:
+            return
+        c = min(c, len(text) - 1)
+
+        def isw(ch):
+            return ch.isalnum() or ch == "_"
+        s0 = e0 = c
+        if isw(text[c]):
+            while s0 > 0 and isw(text[s0 - 1]):
+                s0 -= 1
+            e0 = c
+            while e0 + 1 < len(text) and isw(text[e0 + 1]):
+                e0 += 1
+        self.sel_a = (i, ln, s0)
+        self.sel_b = (i, ln, e0 + 1)
+        self.Refresh()
+
+    def on_right_down(self, evt):
+        px, py = self._client_to_virtual(evt.GetPosition())
+        idx, _zone = self._hit(px, py)
+        has_sel = bool(self.selected_text())
+        menu = wx.Menu()
+        id_sel, id_msg, id_all = wx.NewIdRef(), wx.NewIdRef(), wx.NewIdRef()
+        menu.Append(id_sel, "Salin\tCtrl+C").Enable(has_sel)
+        menu.Append(id_msg, "Salin pesan").Enable(idx >= 0)
+        menu.AppendSeparator()
+        menu.Append(id_all, "Pilih semua\tCtrl+A")
+        menu.Bind(wx.EVT_MENU, lambda _e: self.copy_selection(), id=id_sel)
+        menu.Bind(wx.EVT_MENU,
+                  lambda _e: self._to_clipboard(self.items[idx]["body"]) if idx >= 0 else None,
+                  id=id_msg)
+        menu.Bind(wx.EVT_MENU, lambda _e: self.select_all(), id=id_all)
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def on_key(self, evt):
+        k = evt.GetKeyCode()
+        if evt.ControlDown() and k in (ord("C"), wx.WXK_INSERT) and self.copy_selection():
+            return
+        if evt.ControlDown() and k == ord("A"):
+            self.select_all()
+            return
         evt.Skip()
 
     def jump_to(self, cid, t):
@@ -1130,6 +1417,10 @@ class ChatView(wx.ScrolledWindow):
     # ---------- event ----------
     def on_size(self, evt):
         at_bottom = self._at_bottom()
+        cw = self.GetClientSize().width
+        if cw != self._last_cw:
+            self._last_cw = cw
+            self.sel_a = self.sel_b = None   # pembagian baris berubah -> blok lama tidak valid
         self._layout()
         if at_bottom:
             self._scroll_bottom()
@@ -1212,7 +1503,7 @@ class ChatView(wx.ScrolledWindow):
         r = self.ARROW
         gc.SetPen(wx.Pen(self.C_BORDER, 1))
         gc.SetBrush(wx.Brush(wx.Colour(255, 255, 255, 235)))
-        gc.DrawEllipse(ax, ay, r, r)
+        gc.DrawRoundedRectangle(ax, ay, self.arrow_w, r, r / 2.0)   # tombol bentuk pil
         cx, cy = ax + r / 2, ay + r / 2
         pen = wx.Pen(wx.Colour(90, 100, 115), 2)
         pen.SetCap(wx.CAP_ROUND)
@@ -1228,6 +1519,8 @@ class ChatView(wx.ScrolledWindow):
         head.AddLineToPoint(cx - 6, cy - 2)
         head.AddLineToPoint(cx, cy + 3)
         gc.StrokePath(head)
+        gc.SetFont(self.f_small, wx.Colour(90, 100, 115))   # tulisan kecil "Balas"
+        gc.DrawText(self.LABEL_BALAS, ax + r - 2, ay + (r - self.label_h) / 2.0)
 
     def on_paint(self, _evt):
         dc = wx.PaintDC(self)
@@ -1236,6 +1529,7 @@ class ChatView(wx.ScrolledWindow):
 
         self._draw_bg(dc, cw, ch)
         gc = wx.GraphicsContext.Create(dc)
+        bounds = self._sel_bounds()
 
         for idx, it in enumerate(self.items):
             if it["y"] + it["h"] + self.ARROW < oy or it["y"] - self.ARROW > oy + ch:
@@ -1293,6 +1587,17 @@ class ChatView(wx.ScrolledWindow):
                 gc.SetFont(self.f_quote, qs_c)
                 gc.DrawText(q["snip"], tx, qy + self.QPY + q["nh"])
                 ty += q["h"] + 4
+
+            if bounds:   # blok teks (di bawah tulisan)
+                gc.SetPen(wx.TRANSPARENT_PEN)
+                gc.SetBrush(wx.Brush(self.C_SEL_ME if it["mine"] else self.C_SEL_OTHER))
+                for k, text in enumerate(it["lines"]):
+                    c0, c1 = self._sel_span(bounds, idx, k, text)
+                    if c1 > c0:
+                        pr = it["parts"][k]
+                        x0 = pr[c0 - 1] if c0 > 0 else 0.0
+                        x1 = pr[c1 - 1]
+                        gc.DrawRectangle(x + self.BPX + x0, ty + k * it["lh"], x1 - x0, it["lh"])
 
             gc.SetFont(self.f_msg, fg)
             for ln in it["lines"]:
@@ -2151,6 +2456,9 @@ class ChatFrame(wx.Frame):
         self.vbox.Layout()
 
     def on_input_key(self, evt):
+        if (evt.ControlDown() and evt.GetKeyCode() in (ord("C"), wx.WXK_INSERT)
+                and not self.input.GetStringSelection() and self.view.copy_selection()):
+            return   # tidak ada teks terblok di kolom ketik -> salin blok dari chat
         if evt.GetKeyCode() == wx.WXK_ESCAPE and self.reply_to is not None:
             self.cancel_reply()
             return
