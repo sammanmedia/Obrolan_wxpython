@@ -1,7 +1,11 @@
-# Obrolan v9.3
-# - Teks chat bisa diblok pakai mouse (tahan & geser; klik-ganda = pilih satu kata; Ctrl+A = pilih semua),
-#   lalu disalin dengan Ctrl+C atau klik-kanan -> "Salin" / "Salin pesan".
-# - Tombol panah balas (muncul saat hover chat orang lain) sekarang ada tulisan kecil "Balas".
+# Obrolan v9.4
+# - Update cara baru (tidak lagi mengganti nama exe yang sedang jalan -> penyebab "WinError 2"):
+#     * dijalankan sebagai .exe : unduh Obrolan.exe, simpan sebagai <nama-sekarang>_v9.4.exe di folder yang
+#                                 sama, jalankan, lalu exe LAMA dihapus (ditimpa oleh yang baru).
+#     * dijalankan sebagai .pyw/.py : unduh Obrolan.pyw, simpan sebagai <nama-sekarang>_v9.4.pyw,
+#                                 file lama TIDAK disentuh, lalu aplikasi dibuka ulang dengan file baru.
+#   Contoh nama: tombolapp_obrolan_v8.exe -> tombolapp_obrolan_v9.4.exe
+# - (dari v9.3) Teks chat bisa diblok dan disalin, tombol "Balas".
 # - (dari v9.2) Cek update lewat GitHub Releases: tulisan "Cek update" sejajar dengan "Chatroom Online",
 #   nomor versi "v9.2" di pojok kanan-bawah. Klik saat ada update -> unduh Obrolan.exe baru,
 #   ganti exe lama, aplikasi restart sendiri (khusus dijalankan sebagai .exe).
@@ -45,10 +49,47 @@ else:
 APP_CFG_PATH = APP_DIR / "obrolan.cfg"
 
 # ---- versi & update (GitHub Releases) ----
-VERSION = "9.3"                              # HARUS sama dengan tag Release (tag "v9.3")
+VERSION = "9.4"                              # HARUS sama dengan tag Release (tag "v9.4")
 GITHUB_REPO = "sammanmedia/Obrolan_wxpython"
-UPDATE_ASSET = "Obrolan.exe"                 # nama file exe di Release (tetap, tanpa nomor versi)
-RESTART_EXE = None                           # diisi saat update selesai -> dijalankan ulang di main()
+UPDATE_ASSET = "Obrolan.exe"                 # file untuk pengguna .exe (nama tetap di Release)
+UPDATE_ASSET_PY = "Obrolan.pyw"              # file untuk pengguna .pyw/.py (nama tetap di Release)
+RESTART_CMD = None                           # diisi saat update selesai -> dijalankan ulang di main()
+
+
+def versioned_stem(stem, ver):
+    """Nama file dengan nomor versi baru. 'tombolapp_obrolan_v8' + '9.4' -> 'tombolapp_obrolan_v9.4'.
+    Kalau nama sekarang belum ada nomor versi: 'Obrolan' -> 'Obrolan_v9.4'."""
+    m = re.match(r"^(.*?)([_\-\s]?)[vV]\d+(?:[._]\d+)*$", stem)
+    if m and m.group(1):
+        return f"{m.group(1)}{m.group(2) or '_'}v{ver}"
+    return f"{stem}_v{ver}"
+
+
+def current_app_path():
+    """Lokasi file aplikasi yang sedang berjalan (.exe kalau sudah dibuild, .pyw/.py kalau script)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return Path(__file__).resolve()
+
+
+def hapus_exe_lama(path):
+    """Dijalankan oleh exe BARU: hapus exe lama setelah proses lamanya benar-benar selesai."""
+    try:
+        p = Path(path)
+        me = Path(sys.executable).resolve()
+        # aman: hanya .exe di folder yang sama dan bukan diri sendiri
+        if p.suffix.lower() != ".exe" or p.parent != me.parent or p.resolve() == me:
+            return
+        for _ in range(60):          # coba sampai ~30 detik (exe lama masih menutup diri)
+            if not p.exists():
+                return
+            try:
+                p.unlink()
+                return
+            except OSError:
+                time.sleep(0.5)
+    except Exception:
+        pass
 
 
 def parse_version(v):
@@ -2325,37 +2366,51 @@ class ChatFrame(wx.Frame):
             self._set_upd("Sudah versi terbaru", self.C_UPD_IDLE,
                           f"v{VERSION} adalah versi terbaru. Klik untuk cek lagi.")
 
+    def _upd_plan(self):
+        """-> (frozen, nama asset di Release, path file baru). File baru = nama sekarang dengan versi baru."""
+        frozen = bool(getattr(sys, "frozen", False))
+        cur = current_app_path()
+        ver = ".".join(str(x) for x in parse_version(self._latest_tag))
+        target = cur.with_name(versioned_stem(cur.stem, ver) + cur.suffix)
+        if target == cur:   # nama sama persis dengan yang sedang jalan -> jangan menimpa diri sendiri
+            target = cur.with_name(f"{cur.stem}_update{cur.suffix}")
+        return frozen, (UPDATE_ASSET if frozen else UPDATE_ASSET_PY), target
+
     def on_update_click(self, _evt=None):
         if self._upd_busy:
             return
         if not self._latest_tag:
             self.check_update()
             return
-        if not getattr(sys, "frozen", False):
-            # dijalankan sebagai .pyw -> tidak bisa mengganti diri sendiri, buka halaman Release saja
-            webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
-            self.set_status("Dijalankan dari .pyw: unduh Obrolan.exe terbaru dari halaman Release.")
-            return
-        if wx.MessageBox(f"Perbarui Obrolan ke {self._latest_tag}?\n\n"
-                         "Aplikasi akan ditutup lalu terbuka lagi otomatis.\n"
+        frozen, asset, target = self._upd_plan()
+        if frozen:
+            info = (f"File baru: {target.name}\n"
+                    "Setelah selesai diunduh, aplikasi dibuka ulang dengan file baru, "
+                    "lalu file lama dihapus (diganti).")
+        else:
+            info = (f"File baru: {target.name} (disimpan di folder yang sama)\n"
+                    "File lama TIDAK diubah atau dihapus. Setelah selesai diunduh, "
+                    "aplikasi dibuka ulang memakai file baru.")
+        if wx.MessageBox(f"Perbarui Obrolan ke {self._latest_tag}?\n\n{info}\n\n"
                          "Pengaturan (obrolan.cfg, background) tidak diubah.",
                          "Update", wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES:
             return
         self._upd_busy = True
         self._set_upd("Mengunduh 0%...", self.C_UPD_IDLE)
-        threading.Thread(target=self._upd_download_worker, daemon=True).start()
+        threading.Thread(target=self._upd_download_worker, args=(self._latest_tag,),
+                         daemon=True).start()
 
-    def _upd_download_worker(self):
-        exe = Path(sys.executable)
-        new = exe.with_name(exe.name + ".new")
+    def _upd_download_worker(self, tag):
+        frozen, asset, target = self._upd_plan()
+        part = target.with_name(target.name + ".part")
         try:
-            url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{UPDATE_ASSET}"
+            url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{asset}"
             digest = ""
-            try:  # API dipakai SEKALI saat update, hanya untuk mengambil checksum (boleh gagal)
+            try:  # API dipakai SEKALI saat update, hanya untuk checksum (boleh gagal)
                 j = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
                                  timeout=8, headers={"User-Agent": "Obrolan"}).json()
                 for a in j.get("assets", []):
-                    if a.get("name") == UPDATE_ASSET:
+                    if a.get("name") == asset:
                         digest = str(a.get("digest") or "")
                         url = a.get("browser_download_url") or url
             except Exception:
@@ -2363,25 +2418,35 @@ class ChatFrame(wx.Frame):
             done = 0
             h = hashlib.sha256()
             with requests.get(url, stream=True, timeout=20, headers={"User-Agent": "Obrolan"}) as r:
+                if r.status_code == 404:
+                    raise ValueError(f"File '{asset}' tidak ada di Release {tag}. "
+                                     f"Unggah file bernama persis itu ke Release.")
                 r.raise_for_status()
                 total = int(r.headers.get("Content-Length") or 0)
-                with open(new, "wb") as f:
+                with open(part, "wb") as f:
                     for chunk in r.iter_content(256 * 1024):
                         f.write(chunk)
                         h.update(chunk)
                         done += len(chunk)
                         if total:
                             wx.CallAfter(self._set_upd, f"Mengunduh {done * 100 // total}%...", self.C_UPD_IDLE)
-            with open(new, "rb") as f:
-                head = f.read(2)
-            if head != b"MZ" or done < 1_000_000:
-                raise ValueError("file unduhan tidak valid (bukan exe / terpotong)")
+            if frozen:
+                with open(part, "rb") as f:
+                    head = f.read(2)
+                if head != b"MZ" or done < 1_000_000:
+                    raise ValueError("file unduhan tidak valid (bukan exe / terpotong)")
+            else:
+                text = part.read_bytes().decode("utf-8")
+                compile(text, asset, "exec")          # harus kode Python yang valid
+                if "class ChatFrame" not in text:
+                    raise ValueError("file unduhan bukan script Obrolan")
             if digest.startswith("sha256:") and digest[7:].lower() != h.hexdigest().lower():
                 raise ValueError("checksum tidak cocok, unduhan dibatalkan")
-            wx.CallAfter(self._upd_apply, new)
+            os.replace(part, target)   # file baru siap dengan nama berversi
+            wx.CallAfter(self._upd_apply, frozen, target)
         except Exception as e:
             try:
-                new.unlink()
+                part.unlink()
             except Exception:
                 pass
             wx.CallAfter(self._upd_failed, str(e))
@@ -2391,32 +2456,16 @@ class ChatFrame(wx.Frame):
         self._set_upd("Update gagal (klik untuk coba lagi)", self.C_UPD_ERR, msg)
         wx.MessageBox(f"Update gagal:\n{msg}", "Update", wx.OK | wx.ICON_ERROR, self)
 
-    def _upd_apply(self, new):
-        """Windows tidak boleh menimpa exe yang jalan, tapi BOLEH mengganti namanya:
-        exe lama -> .old, exe baru -> nama asli, lalu restart (di main())."""
-        global RESTART_EXE
-        exe = Path(sys.executable)
-        old = exe.with_name(exe.name + ".old")
-        try:
-            try:
-                if old.exists():
-                    old.unlink()
-            except OSError:
-                old = exe.with_name(f"{exe.name}.{int(time.time())}.old")
-            os.replace(exe, old)
-            try:
-                os.replace(new, exe)
-            except Exception:
-                os.replace(old, exe)   # gagal -> kembalikan exe lama
-                raise
-        except Exception as e:
-            try:
-                new.unlink()
-            except Exception:
-                pass
-            self._upd_failed(f"tidak bisa mengganti file ({e}). Pastikan folder aplikasi bisa ditulis.")
-            return
-        RESTART_EXE = str(exe)
+    def _upd_apply(self, frozen, target):
+        """Tidak ada penggantian nama file yang sedang jalan. File baru sudah berdiri sendiri;
+        tinggal tutup aplikasi ini, jalankan yang baru (main()), dan -khusus exe- exe baru
+        yang menghapus exe lama."""
+        global RESTART_CMD
+        if frozen:
+            RESTART_CMD = [str(target)]
+            os.environ["OBROLAN_HAPUS_LAMA"] = str(current_app_path())
+        else:
+            RESTART_CMD = [sys.executable or "pythonw", str(target)]
         self.exit_app()
 
     # ---------- status baca ----------
@@ -2598,9 +2647,13 @@ class ChatFrame(wx.Frame):
 
 
 def main():
-    if getattr(sys, "frozen", False):  # bersihkan sisa update sebelumnya
-        exe = Path(sys.executable)
-        for p in list(exe.parent.glob(exe.name + ".*old")) + [exe.with_name(exe.name + ".new")]:
+    if getattr(sys, "frozen", False):
+        old = os.environ.pop("OBROLAN_HAPUS_LAMA", "")   # habis update: hapus exe lama
+        if old:
+            threading.Thread(target=hapus_exe_lama, args=(old,), daemon=True).start()
+        exe = Path(sys.executable)   # sisa update cara lama / unduhan terputus
+        for p in list(exe.parent.glob(exe.name + ".*old")) + [exe.with_name(exe.name + ".new")] \
+                + list(exe.parent.glob("*.part")):
             try:
                 p.unlink()
             except OSError:
@@ -2625,12 +2678,13 @@ def main():
     app.MainLoop()
     if srv:
         srv.close()   # lepas kunci dulu supaya instance baru tidak dikira "sudah ada yang jalan"
-    if RESTART_EXE:
+    if RESTART_CMD:
         env = dict(os.environ)
-        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"   # exe PyInstaller baru harus ekstrak sendiri
-        env.pop("_MEIPASS2", None)
+        if getattr(sys, "frozen", False):
+            env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"   # exe PyInstaller baru harus ekstrak sendiri
+            env.pop("_MEIPASS2", None)
         flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        subprocess.Popen([RESTART_EXE], cwd=str(Path(RESTART_EXE).parent), env=env,
+        subprocess.Popen(RESTART_CMD, cwd=str(Path(RESTART_CMD[-1]).parent), env=env,
                          close_fds=True, creationflags=flags)
 
 
