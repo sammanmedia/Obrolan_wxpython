@@ -1,4 +1,7 @@
-# Obrolan v9.4
+# Obrolan v9.5
+# - Kolom ketik berbentuk kapsul (rounded), tombol emoji (papan emoji ala WhatsApp: kategori, terakhir
+#   dipakai) di dalam kolom, dan tombol [Kirim] diganti ikon pesawat kertas.
+# (dari v9.4)
 # - Update cara baru (tidak lagi mengganti nama exe yang sedang jalan -> penyebab "WinError 2"):
 #     * dijalankan sebagai .exe : unduh Obrolan.exe, simpan sebagai <nama-sekarang>_v9.4.exe di folder yang
 #                                 sama, jalankan, lalu exe LAMA dihapus (ditimpa oleh yang baru).
@@ -49,7 +52,7 @@ else:
 APP_CFG_PATH = APP_DIR / "obrolan.cfg"
 
 # ---- versi & update (GitHub Releases) ----
-VERSION = "9.4"                              # HARUS sama dengan tag Release (tag "v9.4")
+VERSION = "9.5"                              # HARUS sama dengan tag Release (tag "v9.5")
 GITHUB_REPO = "sammanmedia/Obrolan_wxpython"
 UPDATE_ASSET = "Obrolan.exe"                 # file untuk pengguna .exe (nama tetap di Release)
 UPDATE_ASSET_PY = "Obrolan.pyw"              # file untuk pengguna .pyw/.py (nama tetap di Release)
@@ -1721,6 +1724,481 @@ class LinkLabel(wx.Window):
         dc.DrawText(self._text, 4, 4)
 
 
+# ====================== ikon & tombol datar (pesawat kirim, emoji) ======================
+def _raster_rgba(size, fn, n=4):
+    """fn(u, v) -> None (transparan) atau (r, g, b). Supersampling n x n supaya tepi halus."""
+    rgb, alpha = bytearray(), bytearray()
+    for py in range(size):
+        for px in range(size):
+            r = g = b = cnt = 0
+            for sy in range(n):
+                for sx in range(n):
+                    c = fn((px + (sx + .5) / n) / size, (py + (sy + .5) / n) / size)
+                    if c:
+                        r += c[0]; g += c[1]; b += c[2]; cnt += 1
+            if cnt:
+                rgb += bytes((r // cnt, g // cnt, b // cnt))
+                alpha.append(cnt * 255 // (n * n))
+            else:
+                rgb += b"\x00\x00\x00"
+                alpha.append(0)
+    return bytes(rgb), bytes(alpha)
+
+
+def _raster_bitmap(size, fn, n=4):
+    rgb, alpha = _raster_rgba(size, fn, n)
+    img = wx.Image(size, size)
+    img.SetData(rgb)
+    img.SetAlpha(alpha)
+    return wx.Bitmap(img)
+
+
+def _in_poly(x, y, pts):
+    inside = False
+    j = len(pts) - 1
+    for i in range(len(pts)):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+# pesawat kertas (segitiga bertakik) ala tombol kirim WhatsApp, kotak 24x24
+_PLANE = [(2.0, 21.0), (23.0, 12.0), (2.0, 3.0), (2.0, 10.0), (17.0, 12.0), (2.0, 14.0)]
+SEND_COLORS = {"normal": (24, 119, 242), "hot": (46, 136, 250), "down": (16, 96, 205)}
+
+
+def _send_fn(color):
+    def fn(u, v):
+        if (u - .5) ** 2 + (v - .5) ** 2 > .25:          # lingkaran tombol
+            return None
+        gx = 12 + (u - .5) / .52 * 24                    # pesawat memenuhi ~52% lebar lingkaran
+        gy = 12 + (v - .5) / .52 * 24
+        return (255, 255, 255) if _in_poly(gx, gy, _PLANE) else color
+    return fn
+
+
+def make_send_bitmaps(size=38):
+    return {k: _raster_bitmap(size, _send_fn(c)) for k, c in SEND_COLORS.items()}
+
+
+SMILEY_COLORS = {"normal": (112, 120, 132), "hot": (52, 60, 74), "down": (24, 119, 242)}
+
+
+def _smiley_fn(color):
+    def fn(u, v):
+        d2 = (u - .5) ** 2 + (v - .5) ** 2
+        if .40 ** 2 <= d2 <= .47 ** 2:                                     # lingkaran wajah
+            return color
+        if (u - .36) ** 2 + (v - .40) ** 2 <= .06 ** 2 or (u - .64) ** 2 + (v - .40) ** 2 <= .06 ** 2:
+            return color                                                   # mata
+        if v >= .56 and .20 ** 2 <= d2 <= .27 ** 2 and abs(u - .5) <= .22:  # senyum
+            return color
+        return None
+    return fn
+
+
+def make_smiley_bitmaps(size=24):
+    return {k: _raster_bitmap(size, _smiley_fn(c)) for k, c in SMILEY_COLORS.items()}
+
+
+class IconButton(wx.Control):
+    """Tombol datar berisi gambar (tanpa tepi/latar bawaan Windows).
+    bmps = {"normal":..., "hot":..., "down":...}. Mengirim wx.EVT_BUTTON saat diklik."""
+    def __init__(self, parent, bmps, tip="", bg=None):
+        super().__init__(parent, style=wx.BORDER_NONE)
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self._bmps = bmps
+        self._bg = bg
+        self._hot = False
+        self._down = False
+        w, h = bmps["normal"].GetWidth(), bmps["normal"].GetHeight()
+        self.SetMinSize(wx.Size(w, h))
+        self.SetInitialSize(wx.Size(w, h))
+        self.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+        if tip:
+            self.SetToolTip(tip)
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_ENTER_WINDOW, lambda e: self._set_state(hot=True))
+        self.Bind(wx.EVT_LEAVE_WINDOW, lambda e: self._set_state(hot=False))
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_down)
+        self.Bind(wx.EVT_LEFT_DCLICK, self._on_down)   # klik cepat = DCLICK di Windows
+        self.Bind(wx.EVT_LEFT_UP, self._on_up)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, lambda e: self._set_state(down=False))
+
+    def _set_state(self, hot=None, down=None):
+        if hot is not None:
+            self._hot = hot
+        if down is not None:
+            self._down = down
+        self.Refresh()
+
+    def _on_down(self, _e):
+        self._set_state(down=True)
+        if not self.HasCapture():
+            self.CaptureMouse()
+
+    def _on_up(self, e):
+        if self.HasCapture():
+            self.ReleaseMouse()
+        was_down = self._down
+        self._set_state(down=False)
+        w, h = self.GetClientSize()
+        if was_down and 0 <= e.GetX() < w and 0 <= e.GetY() < h:
+            evt = wx.CommandEvent(wx.wxEVT_BUTTON, self.GetId())
+            evt.SetEventObject(self)
+            self.GetEventHandler().ProcessEvent(evt)
+
+    def _on_paint(self, _e):
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(self._bg or self.GetParent().GetBackgroundColour()))
+        dc.Clear()
+        key = "down" if (self._down and self._hot) else ("hot" if self._hot else "normal")
+        dc.DrawBitmap(self._bmps.get(key) or self._bmps["normal"], 0, 0, True)
+
+
+class RoundedField(wx.Panel):
+    """Kolom ketik berbentuk kapsul (rounded): wx.TextCtrl tanpa tepi + tombol emoji di sisi kanan."""
+    C_BORDER = wx.Colour(206, 211, 218)
+    C_FOCUS = wx.Colour(24, 119, 242)
+    HEIGHT = 38
+
+    def __init__(self, parent, on_emoji):
+        super().__init__(parent, style=wx.BORDER_NONE | wx.TAB_TRAVERSAL)
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self._focus = False
+        self.text = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER | wx.BORDER_NONE)
+        self.text.SetBackgroundColour(wx.WHITE)
+        self.emoji_btn = IconButton(self, make_smiley_bitmaps(24), tip="Emoji", bg=wx.WHITE)
+        self.emoji_btn.Bind(wx.EVT_BUTTON, lambda e: on_emoji())
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(self.text, 1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 16)
+        row.Add(self.emoji_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 8)
+        self.SetSizer(row)
+        self.SetMinSize(wx.Size(-1, self.HEIGHT))
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_SIZE, self._on_size)
+        self.Bind(wx.EVT_LEFT_DOWN, lambda e: self.text.SetFocus())   # klik area kosong -> fokus ke teks
+        self.text.Bind(wx.EVT_SET_FOCUS, lambda e: self._set_focus(True, e))
+        self.text.Bind(wx.EVT_KILL_FOCUS, lambda e: self._set_focus(False, e))
+
+    def _set_focus(self, v, evt):
+        self._focus = v
+        self.Refresh()
+        evt.Skip()
+
+    def _on_size(self, evt):
+        self.Refresh()
+        evt.Skip()
+
+    def _on_paint(self, _e):
+        dc = wx.PaintDC(self)
+        gc = wx.GraphicsContext.Create(dc)
+        w, h = self.GetClientSize()
+        gc.SetPen(wx.TRANSPARENT_PEN)
+        gc.SetBrush(wx.Brush(self.GetParent().GetBackgroundColour()))
+        gc.DrawRectangle(0, 0, w, h)
+        gc.SetPen(wx.Pen(self.C_FOCUS if self._focus else self.C_BORDER, 2 if self._focus else 1))
+        gc.SetBrush(wx.Brush(wx.WHITE))
+        gc.DrawRoundedRectangle(1, 1, w - 2, h - 2, (h - 2) / 2.0)
+
+
+# ====================== emoji (daftar ala WhatsApp, tanpa ZWJ/bendera) ======================
+# Karakter yang secara bawaan tampil sebagai teks harus diberi variation selector (U+FE0F) agar jadi emoji.
+_VS16_RANGES = (
+    (0xA9, 0xA9), (0xAE, 0xAE), (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139),
+    (0x2194, 0x2199), (0x21A9, 0x21AA), (0x2328, 0x2328), (0x23CF, 0x23CF), (0x23ED, 0x23EF),
+    (0x23F1, 0x23F2), (0x23F8, 0x23FA), (0x24C2, 0x24C2), (0x25AA, 0x25AB), (0x25B6, 0x25B6),
+    (0x25C0, 0x25C0), (0x25FB, 0x25FC), (0x2600, 0x2604), (0x260E, 0x260E), (0x2611, 0x2611),
+    (0x2618, 0x2618), (0x261D, 0x261D), (0x2620, 0x2620), (0x2622, 0x2623), (0x2626, 0x2626),
+    (0x262A, 0x262A), (0x262E, 0x262F), (0x2638, 0x263A), (0x2640, 0x2640), (0x2642, 0x2642),
+    (0x2660, 0x2660), (0x2663, 0x2663), (0x2665, 0x2666), (0x2668, 0x2668), (0x267B, 0x267B),
+    (0x267E, 0x267E), (0x2692, 0x2692), (0x2694, 0x2697), (0x2699, 0x2699), (0x269B, 0x269C),
+    (0x26A0, 0x26A0), (0x26B0, 0x26B1), (0x26C8, 0x26C8), (0x26CF, 0x26CF), (0x26D1, 0x26D1),
+    (0x26D3, 0x26D3), (0x26E9, 0x26E9), (0x26F0, 0x26F1), (0x26F4, 0x26F4), (0x26F7, 0x26F9),
+    (0x2702, 0x2702), (0x2708, 0x2709), (0x270C, 0x270D), (0x270F, 0x270F), (0x2712, 0x2712),
+    (0x2714, 0x2714), (0x2716, 0x2716), (0x271D, 0x271D), (0x2721, 0x2721), (0x2733, 0x2734),
+    (0x2744, 0x2744), (0x2747, 0x2747), (0x2763, 0x2764), (0x27A1, 0x27A1), (0x2934, 0x2935),
+    (0x2B05, 0x2B07), (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297), (0x3299, 0x3299),
+    (0x1F170, 0x1F171), (0x1F17E, 0x1F17F), (0x1F202, 0x1F202), (0x1F237, 0x1F237), (0x1F321, 0x1F321),
+    (0x1F324, 0x1F32C), (0x1F336, 0x1F336), (0x1F37D, 0x1F37D), (0x1F396, 0x1F397), (0x1F399, 0x1F39B),
+    (0x1F39E, 0x1F39F), (0x1F3CB, 0x1F3CE), (0x1F3D4, 0x1F3DF), (0x1F3F3, 0x1F3F3), (0x1F3F5, 0x1F3F5),
+    (0x1F3F7, 0x1F3F7), (0x1F43F, 0x1F43F), (0x1F441, 0x1F441), (0x1F4FD, 0x1F4FD), (0x1F549, 0x1F54A),
+    (0x1F56F, 0x1F570), (0x1F573, 0x1F579), (0x1F587, 0x1F587), (0x1F58A, 0x1F58D), (0x1F590, 0x1F590),
+    (0x1F5A5, 0x1F5A5), (0x1F5A8, 0x1F5A8), (0x1F5B1, 0x1F5B2), (0x1F5BC, 0x1F5BC), (0x1F5C2, 0x1F5C4),
+    (0x1F5D1, 0x1F5D3), (0x1F5DC, 0x1F5DE), (0x1F5E1, 0x1F5E1), (0x1F5E3, 0x1F5E3), (0x1F5E8, 0x1F5E8),
+    (0x1F5EF, 0x1F5EF), (0x1F5F3, 0x1F5F3), (0x1F5FA, 0x1F5FA), (0x1F6CB, 0x1F6CB), (0x1F6CD, 0x1F6CF),
+    (0x1F6E0, 0x1F6E5), (0x1F6E9, 0x1F6E9), (0x1F6F0, 0x1F6F0), (0x1F6F3, 0x1F6F3),
+)
+
+
+def _emojify(tok):
+    base = tok.replace("\ufe0f", "")
+    if len(base) == 1 and any(a <= ord(base) <= b for a, b in _VS16_RANGES):
+        return base + "\ufe0f"
+    return base
+
+
+_EMOJI_RAW = {
+    "Smiley & Orang": """
+😀 😃 😄 😁 😆 😅 🤣 😂 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😗 ☺ 😚 😙 😋 😛 😜 🤪 😝 🤑 🤗 🤭 🤫 🤔 🤐 🤨
+😐 😑 😶 😏 😒 🙄 😬 🤥 😌 😔 😪 🤤 😴 😷 🤒 🤕 🤢 🤮 🤧 🥵 🥶 🥴 😵 🤯 🤠 🥳 😎 🤓 🧐 😕 😟 🙁 ☹
+😮 😯 😲 😳 🥺 😦 😧 😨 😰 😥 😢 😭 😱 😖 😣 😞 😓 😩 😫 😤 😡 😠 🤬 😈 👿 💀 ☠ 💩 🤡 👹 👺 👻 👽 👾 🤖
+😺 😸 😹 😻 😼 😽 🙀 😿 😾 🙈 🙉 🙊 💋 💌 💘 💝 💖 💗 💓 💞 💕 💟 ❣ 💔 ❤ 🧡 💛 💚 💙 💜 🖤 💯 💢 💥 💫 💦 💨 💤
+👋 🤚 🖐 ✋ 🖖 👌 ✌ 🤞 🤟 🤘 🤙 👈 👉 👆 🖕 👇 ☝ 👍 👎 ✊ 👊 🤛 🤜 👏 🙌 👐 🤲 🤝 🙏 ✍ 💅 🤳 💪 🦵 🦶
+👂 👃 🧠 🦷 🦴 👀 👁 👅 👄 👶 🧒 👦 👧 🧑 👨 👩 🧓 👴 👵 🙍 🙎 🙅 🙆 💁 🙋 🙇 🤦 🤷 💆 💇 🚶 🏃 💃 🕺 👯 🧖
+🗣 👤 👥 👪 💑 💏 🧥 👔 👕 👖 👗 👘 👙 👚 👛 👜 👝 🎒 👞 👟 👠 👡 👢 👑 👒 🎩 🎓 🧢 💄 💍 💼
+""",
+    "Hewan & Alam": """
+🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐽 🐸 🐵 🐔 🐧 🐦 🐤 🐣 🐥 🦆 🦅 🦉 🦇 🐺 🐗 🐴 🦄 🐝 🐛 🦋 🐌 🐞 🐜 🦟 🦗
+🕷 🕸 🦂 🐢 🐍 🦎 🦖 🦕 🐙 🦑 🦐 🦞 🦀 🐡 🐠 🐟 🐬 🐳 🐋 🦈 🐊 🐅 🐆 🦓 🦍 🐘 🦏 🦛 🐪 🐫 🦒 🦘 🐃 🐂 🐄 🐎 🐖 🐏
+🐑 🦙 🐐 🦌 🐕 🐩 🐈 🐓 🦃 🦚 🦜 🦢 🕊 🐇 🦝 🦡 🐁 🐀 🐿 🦔 🐾 🐉 🐲 🌵 🎄 🌲 🌳 🌴 🌱 🌿 ☘ 🍀 🎍 🎋 🍃 🍂 🍁
+🍄 🌾 💐 🌷 🌹 🥀 🌺 🌸 🌼 🌻 🌞 🌝 🌛 🌜 🌚 🌕 🌖 🌗 🌘 🌑 🌒 🌓 🌔 🌙 🌎 🌍 🌏 ⭐ 🌟 ✨ ⚡ ☄ 🔥 🌪 🌈 ☀ 🌤
+⛅ 🌥 ☁ 🌦 🌧 ⛈ 🌩 🌨 ❄ ☃ ⛄ 🌬 💧 ☔ ☂ 🌊 🌫
+""",
+    "Makanan & Minuman": """
+🍏 🍎 🍐 🍊 🍋 🍌 🍉 🍇 🍓 🍈 🍒 🍑 🥭 🍍 🥥 🥝 🍅 🍆 🥑 🥦 🥬 🥒 🌶 🌽 🥕 🥔 🍠 🥐 🥯 🍞 🥖 🥨 🧀 🥚 🍳 🥞
+🥓 🥩 🍗 🍖 🌭 🍔 🍟 🍕 🥪 🥙 🌮 🌯 🥗 🥘 🥫 🍝 🍜 🍲 🍛 🍣 🍱 🥟 🍤 🍙 🍚 🍘 🍥 🥠 🥮 🍢 🍡 🍧 🍨 🍦 🥧 🧁
+🍰 🎂 🍮 🍭 🍬 🍫 🍿 🍩 🍪 🌰 🥜 🍯 🥛 🍼 ☕ 🍵 🥤 🍶 🍺 🍻 🥂 🍷 🥃 🍸 🍹 🍾 🥄 🍴 🍽 🥣 🥡 🥢 🧂
+""",
+    "Aktivitas": """
+⚽ 🏀 🏈 ⚾ 🥎 🎾 🏐 🏉 🥏 🎱 🏓 🏸 🏒 🏑 🥍 🏏 🥅 ⛳ 🏹 🎣 🥊 🥋 🎽 🛹 🛷 ⛸ 🥌 🎿 ⛷ 🏂 🏋 🤼 🤸 ⛹ 🤺
+🤾 🏌 🏇 🧘 🏄 🏊 🤽 🚣 🧗 🚵 🚴 🏆 🥇 🥈 🥉 🏅 🎖 🏵 🎗 🎫 🎟 🎪 🤹 🎭 🎨 🎬 🎤 🎧 🎼 🎹 🥁 🎷 🎺 🎸 🎻
+🎲 🧩 ♟ 🎯 🎳 🎮 🎰 🎁 🎈 🎀 🎊 🎉 🎎 🎏 🎐 🎃 🎄 🎆 🎇 ✨
+""",
+    "Perjalanan & Tempat": """
+🚗 🚕 🚙 🚌 🚎 🏎 🚓 🚑 🚒 🚐 🚚 🚛 🚜 🛴 🚲 🛵 🏍 🚨 🚔 🚍 🚘 🚖 🚡 🚠 🚟 🚃 🚋 🚞 🚝 🚄 🚅 🚈 🚂 🚆 🚇 🚊
+🚉 ✈ 🛫 🛬 🛩 💺 🛰 🚀 🛸 🚁 🛶 ⛵ 🚤 🛥 🛳 ⛴ 🚢 ⚓ ⛽ 🚧 🚦 🚥 🚏 🗺 🗿 🗽 🗼 🏰 🏯 🏟 🎡 🎢 🎠 ⛲ ⛱
+🏖 🏝 🏜 🌋 ⛰ 🏔 🗻 🏕 ⛺ 🏠 🏡 🏘 🏚 🏗 🏭 🏢 🏬 🏣 🏤 🏥 🏦 🏨 🏪 🏫 🏩 💒 🏛 ⛪ 🕌 🕍 🕋 ⛩ 🛤 🛣
+🗾 🎑 🏞 🌅 🌄 🌠 🎇 🎆 🌇 🌆 🏙 🌃 🌌 🌉 🌁
+""",
+    "Objek": """
+⌚ 📱 📲 💻 ⌨ 🖥 🖨 🖱 🖲 🕹 🗜 💽 💾 💿 📀 📼 📷 📸 📹 🎥 📽 🎞 📞 ☎ 📟 📠 📺 📻 🎙 🎚 🎛 ⏱ ⏲ ⏰ 🕰
+⌛ ⏳ 📡 🔋 🔌 💡 🔦 🕯 🗑 🛢 💸 💵 💴 💶 💷 💰 💳 💎 ⚖ 🔧 🔨 ⚒ 🛠 ⛏ 🔩 ⚙ ⛓ 🔫 💣 🔪 🗡 ⚔ 🛡 🚬 ⚰ ⚱
+🏺 🔮 📿 💈 ⚗ 🔭 🔬 🕳 💊 💉 🌡 🚽 🚰 🚿 🛁 🛀 🛎 🔑 🗝 🚪 🛋 🛏 🛌 🖼 🛍 🛒 🎁 ✉ 📩 📨 📧 📥 📤 📦 🏷
+📪 📫 📬 📭 📮 📯 📜 📃 📄 📑 📊 📈 📉 🗒 🗓 📆 📅 📇 🗃 🗳 🗄 📋 📁 📂 🗂 🗞 📰 📓 📔 📒 📕 📗 📘 📙 📚 📖
+🔖 🔗 📎 🖇 📐 📏 📌 📍 ✂ 🖊 🖋 ✒ 🖌 🖍 📝 ✏ 🔍 🔎 🔏 🔐 🔒 🔓
+""",
+    "Simbol": """
+❤ 🧡 💛 💚 💙 💜 🖤 💔 ❣ 💕 💞 💓 💗 💖 💘 💝 💟 ☮ ✝ ☪ 🕉 ☸ ✡ 🔯 🕎 ☯ ☦ 🛐 ⛎ ♈ ♉ ♊ ♋ ♌ ♍ ♎ ♏ ♐ ♑ ♒ ♓
+🆔 ⚛ 🉑 ☢ ☣ 📴 📳 🈶 🈚 🈸 🈺 🈷 ✴ 🆚 💮 🉐 ㊙ ㊗ 🈴 🈵 🈹 🈲 🅰 🅱 🆎 🆑 🅾 🆘 ❌ ⭕ 🛑 ⛔ 📛 🚫 💯 💢
+♨ 🚷 🚯 🚳 🚱 🔞 📵 🚭 ❗ ❕ ❓ ❔ ‼ ⁉ 🔅 🔆 〽 ⚠ 🚸 🔱 ⚜ 🔰 ♻ ✅ 🈯 💹 ❇ ✳ ❎ 🌐 💠 Ⓜ 🌀 💤 🏧 🚾 ♿ 🅿
+🈳 🈂 🛂 🛃 🛄 🛅 🚹 🚺 🚼 🚻 🚮 🎦 📶 🈁 🔣 ℹ 🔤 🔡 🔠 🆖 🆗 🆙 🆒 🆕 🆓 🔟 🔢 ⏏ ▶ ⏸ ⏯ ⏹ ⏺ ⏭ ⏮ ⏩ ⏪ ⏫ ⏬
+◀ 🔼 🔽 ➡ ⬅ ⬆ ⬇ ↗ ↘ ↙ ↖ ↕ ↔ ↪ ↩ ⤴ ⤵ 🔀 🔁 🔂 🔄 🔃 🎵 🎶 ➕ ➖ ➗ ✖ ♾ 💲 💱 ™ © ® 〰 ➰ ➿ 🔚 🔙 🔛 🔝 🔜
+✔ ☑ 🔘 ⚪ ⚫ 🔴 🔵 🔺 🔻 🔸 🔹 🔶 🔷 🔳 🔲 ▪ ▫ ◾ ◽ ◼ ◻ ⬛ ⬜ 🔈 🔇 🔉 🔊 🔔 🔕 📣 📢 💬 💭 🗯 ♠ ♣ ♥ ♦ 🃏 🎴 🀄
+""",
+}
+_KEYCAPS = [d + "\ufe0f\u20e3" for d in "0123456789#*"]
+
+
+def build_emoji_categories():
+    """-> [(nama kategori, ikon tab, [emoji...]), ...] (urutan seperti WhatsApp)."""
+    icons = {"Smiley & Orang": "😀", "Hewan & Alam": "🐻", "Makanan & Minuman": "🍔",
+             "Aktivitas": "⚽", "Perjalanan & Tempat": "🚗", "Objek": "💡", "Simbol": "❤"}
+    cats = []
+    for name, raw in _EMOJI_RAW.items():
+        seen, items = set(), []
+        for tok in raw.split() + (_KEYCAPS if name == "Simbol" else []):
+            e = tok if "\u20e3" in tok else _emojify(tok)
+            if e not in seen:
+                seen.add(e)
+                items.append(e)
+        cats.append((name, _emojify(icons[name]), items))
+    return cats
+
+
+EMOJI_CATEGORIES = build_emoji_categories()
+
+
+def emoji_font(pt):
+    info = wx.FontInfo(pt)
+    if sys.platform.startswith("win"):
+        info = info.FaceName("Segoe UI Emoji")
+    return wx.Font(info)
+
+
+def grid_index(x, y, cell, cols, count):
+    """Posisi (x, y) piksel di dalam grid -> index emoji, atau -1 bila di luar/kosong."""
+    if x < 0 or y < 0 or x >= cols * cell:
+        return -1
+    i = (y // cell) * cols + (x // cell)
+    return i if 0 <= i < count else -1
+
+
+class EmojiTabs(wx.Window):
+    """Deretan ikon kategori di bagian atas (klik = pindah kategori)."""
+    def __init__(self, parent, icons, on_select):
+        super().__init__(parent, style=wx.BORDER_NONE)
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.icons = icons
+        self.on_select = on_select
+        self.sel = 0
+        self.hot = -1
+        self.font = emoji_font(13)
+        self.SetMinSize(wx.Size(-1, 38))
+        self.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_MOTION, self._on_motion)
+        self.Bind(wx.EVT_LEAVE_WINDOW, lambda e: self._set_hot(-1))
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_down)
+        self.Bind(wx.EVT_LEFT_DCLICK, self._on_down)
+
+    def set_selected(self, i):
+        self.sel = i
+        self.Refresh()
+
+    def _set_hot(self, i):
+        if i != self.hot:
+            self.hot = i
+            self.Refresh()
+
+    def _idx(self, x):
+        w = max(self.GetClientSize().width, 1)
+        i = int(x * len(self.icons) / w)
+        return i if 0 <= i < len(self.icons) else -1
+
+    def _on_motion(self, e):
+        self._set_hot(self._idx(e.GetX()))
+        e.Skip()
+
+    def _on_down(self, e):
+        i = self._idx(e.GetX())
+        if i >= 0:
+            self.on_select(i)
+
+    def _on_paint(self, _e):
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(wx.Colour(246, 248, 250)))
+        dc.Clear()
+        w, h = self.GetClientSize()
+        seg = w / float(len(self.icons))
+        dc.SetFont(self.font)
+        dc.SetTextForeground(wx.Colour(60, 66, 76))
+        for i, ic in enumerate(self.icons):
+            x0 = int(i * seg)
+            if i == self.hot and i != self.sel:
+                dc.SetPen(wx.TRANSPARENT_PEN)
+                dc.SetBrush(wx.Brush(wx.Colour(232, 236, 241)))
+                dc.DrawRectangle(x0, 0, int(seg) + 1, h - 3)
+            tw, th = dc.GetTextExtent(ic)
+            dc.DrawText(ic, int(x0 + (seg - tw) / 2), (h - 3 - th) // 2)
+            if i == self.sel:
+                dc.SetPen(wx.TRANSPARENT_PEN)
+                dc.SetBrush(wx.Brush(wx.Colour(24, 119, 242)))
+                dc.DrawRectangle(x0 + 4, h - 3, int(seg) - 8, 3)
+
+
+class EmojiGrid(wx.ScrolledWindow):
+    CELL = 38
+    COLS = 8
+
+    def __init__(self, parent, on_pick):
+        super().__init__(parent, style=wx.VSCROLL | wx.BORDER_NONE)
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.SetBackgroundColour(wx.WHITE)
+        self.SetScrollRate(0, self.CELL // 2)
+        self.on_pick = on_pick
+        self.items = []
+        self.empty_text = ""
+        self.hover = -1
+        self.font = emoji_font(16)
+        self.f_hint = wx.Font(wx.FontInfo(9))
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_MOTION, self._on_motion)
+        self.Bind(wx.EVT_LEAVE_WINDOW, lambda e: self._set_hover(-1))
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_down)
+        self.Bind(wx.EVT_LEFT_DCLICK, self._on_down)   # klik cepat = DCLICK di Windows
+
+    def set_items(self, items, empty_text=""):
+        self.items = list(items)
+        self.empty_text = empty_text
+        self.hover = -1
+        rows = (len(self.items) + self.COLS - 1) // self.COLS
+        self.SetVirtualSize((self.COLS * self.CELL, max(rows * self.CELL, 1)))
+        self.Scroll(0, 0)
+        self.Refresh()
+
+    def _set_hover(self, i):
+        if i != self.hover:
+            self.hover = i
+            self.Refresh()
+
+    def _index_at(self, pos):
+        x, y = self.CalcUnscrolledPosition(pos)
+        return grid_index(x, y, self.CELL, self.COLS, len(self.items))
+
+    def _on_motion(self, e):
+        self._set_hover(self._index_at(e.GetPosition()))
+        e.Skip()
+
+    def _on_down(self, e):
+        i = self._index_at(e.GetPosition())
+        if i >= 0:
+            self.on_pick(self.items[i])
+
+    def _on_paint(self, _e):
+        dc = wx.PaintDC(self)
+        self.DoPrepareDC(dc)
+        vx, vy = self.CalcUnscrolledPosition(0, 0)
+        cw, ch = self.GetClientSize()
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.SetBrush(wx.Brush(wx.WHITE))
+        dc.DrawRectangle(vx, vy, cw + 1, ch + 1)
+        if not self.items:
+            dc.SetFont(self.f_hint)
+            dc.SetTextForeground(wx.Colour(130, 136, 145))
+            dc.DrawText(self.empty_text, 12, 12)
+            return
+        dc.SetFont(self.font)
+        dc.SetTextForeground(wx.Colour(30, 33, 38))
+        first = max(0, vy // self.CELL)
+        last = min((len(self.items) - 1) // self.COLS, (vy + ch) // self.CELL)
+        for row in range(first, last + 1):
+            for col in range(self.COLS):
+                i = row * self.COLS + col
+                if i >= len(self.items):
+                    break
+                x, y = col * self.CELL, row * self.CELL
+                if i == self.hover:
+                    dc.SetBrush(wx.Brush(wx.Colour(233, 237, 242)))
+                    dc.DrawRoundedRectangle(x + 2, y + 2, self.CELL - 4, self.CELL - 4, 8)
+                tw, th = dc.GetTextExtent(self.items[i])
+                dc.DrawText(self.items[i], x + (self.CELL - tw) // 2, y + (self.CELL - th) // 2)
+
+
+class EmojiPopup(wx.PopupTransientWindow):
+    """Papan emoji: tab kategori di atas, grid yang bisa di-scroll di bawahnya."""
+    def __init__(self, parent, recent, on_pick, on_closed):
+        super().__init__(parent, wx.BORDER_SIMPLE)
+        self.on_closed = on_closed
+        self.SetBackgroundColour(wx.WHITE)
+        self.cats = [("Terakhir dipakai", "\U0001F552", list(recent))] + list(EMOJI_CATEGORIES)
+        self.tabs = EmojiTabs(self, [c[1] for c in self.cats], self.select)
+        self.title = wx.StaticText(self, label="")
+        self.title.SetFont(wx.Font(wx.FontInfo(9).Bold()))
+        self.title.SetForegroundColour(wx.Colour(90, 96, 105))
+        self.grid = EmojiGrid(self, on_pick)
+        box = wx.BoxSizer(wx.VERTICAL)
+        box.Add(self.tabs, 0, wx.EXPAND)
+        box.Add(self.title, 0, wx.LEFT | wx.TOP | wx.BOTTOM, 8)
+        box.Add(self.grid, 1, wx.EXPAND)
+        self.SetSizer(box)
+        self.SetSize(wx.Size(EmojiGrid.COLS * EmojiGrid.CELL + 24, 380))
+        self.select(1 if not recent else 0)
+
+    def select(self, i):
+        name, _icon, items = self.cats[i]
+        self.title.SetLabel(name)
+        self.tabs.set_selected(i)
+        self.grid.set_items(items, "Belum ada emoji yang dipakai" if i == 0 else "")
+        self.Layout()
+
+    def OnDismiss(self):
+        self.on_closed(self)
+
+
 # ====================== popup daftar user online ======================
 class OnlinePopup(wx.PopupTransientWindow):
     def __init__(self, parent, on_pick, on_closed):
@@ -1901,11 +2379,13 @@ class ChatFrame(wx.Frame):
         vbox.Hide(self.reply_panel)
         self.vbox = vbox
 
+        # kolom ketik kapsul (rounded) + emoji di dalamnya; tombol kirim = ikon pesawat kertas
         bottom = wx.BoxSizer(wx.HORIZONTAL)
-        self.input = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
-        self.btn = wx.Button(panel, label="Kirim")
-        bottom.Add(self.input, 1, wx.RIGHT, 6)
-        bottom.Add(self.btn, 0)
+        self.field = RoundedField(panel, self.on_emoji_click)
+        self.input = self.field.text
+        self.btn = IconButton(panel, make_send_bitmaps(38), tip="Kirim (Enter)")
+        bottom.Add(self.field, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        bottom.Add(self.btn, 0, wx.ALIGN_CENTER_VERTICAL)
         vbox.Add(bottom, 0, wx.EXPAND | wx.ALL, 8)
 
         # footer: baris 1 = status koneksi, baris 2 = "Chatroom Online : N orang" (bisa diklik)
@@ -1935,6 +2415,8 @@ class ChatFrame(wx.Frame):
         self.online = None          # None = belum tahu / gagal; list = [{cid, name}]
         self._online_popup = None
         self._popup_closed_at = 0.0
+        self._emoji_popup = None
+        self._emoji_closed_at = 0.0
         self.online_err = ""
         self.my_read = 0            # waktu pesan terakhir yang sudah SAYA baca (dikirim ke server)
         self.others_read = 0        # waktu pesan terakhir yang sudah dibaca ORANG LAIN
@@ -2239,6 +2721,7 @@ class ChatFrame(wx.Frame):
 
     def _close_popup(self):
         """Tutup + bersihkan popup apa pun kondisinya (aman dipanggil kapan saja)."""
+        self._close_emoji()
         pop = self._online_popup
         self._online_popup = None
         if pop is None:
@@ -2487,6 +2970,67 @@ class ChatFrame(wx.Frame):
             self.my_read = t
             self.ping_presence()
 
+    # ---------- emoji ----------
+    def _emoji_alive(self):
+        pop = getattr(self, "_emoji_popup", None)
+        if pop is None:
+            return False
+        try:
+            return bool(pop.IsShown())
+        except RuntimeError:       # objek sudah dihancurkan
+            return False
+
+    def _close_emoji(self):
+        pop = getattr(self, "_emoji_popup", None)
+        self._emoji_popup = None
+        if pop is None:
+            return
+        try:
+            pop.Dismiss()
+        except Exception:
+            pass
+        wx.CallAfter(self._destroy_popup, pop)
+
+    def _emoji_closed(self, pop):
+        self._emoji_closed_at = time.time()
+        if self._emoji_popup is pop:
+            self._emoji_popup = None
+        wx.CallAfter(self._destroy_popup, pop)
+
+    def on_emoji_click(self):
+        # klik yang tadinya hanya menutup papan (menutup sendiri saat mouse ditekan) -> jangan buka lagi
+        if time.time() - self._emoji_closed_at < 0.35:
+            return
+        if self._emoji_popup is not None:
+            alive = self._emoji_alive()
+            self._close_emoji()
+            if alive:
+                return                  # klik saat papan terbuka = tutup
+        try:
+            pop = EmojiPopup(self, self.cfg.get("emoji_recent", []), self.on_emoji_pick, self._emoji_closed)
+            self._emoji_popup = pop
+            pw, ph = pop.GetSize()
+            fp = self.field.ClientToScreen(wx.Point(0, 0))
+            fw, _fh = self.field.GetSize()
+            idx = wx.Display.GetFromWindow(self)
+            area = wx.Display(idx if idx != wx.NOT_FOUND else 0).GetClientArea()
+            x = min(max(fp.x + fw - pw, area.x), area.x + area.width - pw)   # rata kanan dengan kolom ketik
+            y = max(fp.y - ph - 6, area.y)                                    # tepat di atas kolom ketik
+            pop.Position(wx.Point(x, y), wx.Size(0, 0))
+            pop.Popup()
+        except Exception:
+            self._close_emoji()
+
+    def on_emoji_pick(self, emo):
+        """Klik emoji -> masuk ke kolom ketik (papan tetap terbuka supaya bisa pilih lagi)."""
+        self.input.WriteText(emo)
+        rec = [e for e in self.cfg.get("emoji_recent", []) if e != emo]
+        rec.insert(0, emo)
+        self.cfg["emoji_recent"] = rec[:24]
+        save_config(self.cfg)
+        if wx.Window.FindFocus() is not self.input:
+            wx.CallAfter(self.input.SetFocus)
+
     # ---------- reply ----------
     def begin_reply(self, item):
         body = " ".join(item["body"].split())
@@ -2508,6 +3052,9 @@ class ChatFrame(wx.Frame):
         if (evt.ControlDown() and evt.GetKeyCode() in (ord("C"), wx.WXK_INSERT)
                 and not self.input.GetStringSelection() and self.view.copy_selection()):
             return   # tidak ada teks terblok di kolom ketik -> salin blok dari chat
+        if evt.GetKeyCode() == wx.WXK_ESCAPE and self._emoji_popup is not None:
+            self._close_emoji()
+            return
         if evt.GetKeyCode() == wx.WXK_ESCAPE and self.reply_to is not None:
             self.cancel_reply()
             return
@@ -2633,6 +3180,7 @@ class ChatFrame(wx.Frame):
         if self.reply_to is not None:
             message = encode_reply(self.reply_to, message)
             self.cancel_reply()
+        self._close_emoji()
         self.input.Clear()
         self.force_bottom = True
         threading.Thread(target=self._post, args=(self.server, name, message), daemon=True).start()
